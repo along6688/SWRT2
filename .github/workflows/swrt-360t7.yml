@@ -1,4 +1,4 @@
-name: Build SWRT 360T7 (swrt-gpl official)
+name: Build SWRT 360T7 (swrt-gpl)
 on:
   workflow_dispatch:
   push:
@@ -9,53 +9,37 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 360
     steps:
-      - name: Fix /bin/sh to bash
+      - name: Fix /bin/sh point to bash
         run: sudo ln -sf /bin/bash /bin/sh
 
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
-          sudo apt update
-          sudo apt install -y build-essential asciidoc binutils bison bzip2 gawk gettext git libncurses5-dev libz-dev patch python3 python2 unzip zlib1g-dev lib32gcc-s1 libc6-dev-i386 subversion flex uglifyjs git-core gcc-multilib p7zip p7zip-full msmtp libssl-dev texinfo libglib2.0-dev xmlto qemu-utils upx libelf-dev autoconf automake libtool autopoint device-tree-compiler g++-multilib antlr3 gperf wget libncurses5 libelf1 lib32z1 lib32stdc++6 gtk-doc-tools intltool binutils-dev cmake lzma liblzma-dev lzma-dev uuid-dev liblzo2-dev xsltproc dos2unix libstdc++6 sharutils autogen shtool
+          sudo apt-get update
+          sudo apt-get -y install build-essential asciidoc binutils bison bzip2 gawk gettext git libncurses5-dev libz-dev patch python3 python2 unzip zlib1g-dev lib32gcc-s1 libc6-dev-i386 subversion flex uglifyjs git-core gcc-multilib p7zip p7zip-full msmtp libssl-dev texinfo libglib2.0-dev xmlto qemu-utils upx libelf-dev autoconf automake libtool autopoint device-tree-compiler g++-multilib antlr3 gperf wget libncurses5 libelf1 lib32z1 lib32stdc++6 gtk-doc-tools intltool binutils-dev cmake lzma liblzma-dev lzma-dev uuid-dev liblzo2-dev xsltproc dos2unix libstdc++6 sharutils autogen shtool
 
-      - name: Clone swrt-gpl
+      - name: Clone swrt-gpl repository
         run: git clone --depth=1 https://github.com/SWRT-dev/swrt-gpl.git
 
-      - name: Clone mtk-toolchains
-        run: git clone --depth=1 https://github.com/SWRT-dev/mtk-toolchains.git
-              - name: Clone swrt-gpl
-        run: git clone --depth=1 https://github.com/SWRT-dev/swrt-gpl.git
-
-      - name: Clone mtk-toolchains
+      - name: Clone mtk-toolchains repository
         run: git clone --depth=1 https://github.com/SWRT-dev/mtk-toolchains.git
 
-      # ==========新增：配置git身份，解决 empty ident name报错 ==========
-      - name: Setup git identity
+      - name: Configure git global identity  # 修复 fatal: empty ident name
         run: |
           git config --global user.name "github-actions"
           git config --global user.email "actions@github.com"
 
-      - name: Link toolchain to /opt
+      - name: Link mtk toolchain to /opt
         run: |
           cd mtk-toolchains
           sudo ln -sf $(pwd)/toolchain-aarch64_cortex-a53_gcc-8.4.0_musl /opt/
 
-      - name: Compile 360T7
+      - name: Start compile target swrt-swrt360t7
         working-directory: ./swrt-gpl/release/src-mtk-arm
         run: make swrt-swrt360t7
 
-
-      - name: Link toolchain to /opt
-        run: |
-          cd mtk-toolchains
-          sudo ln -sf $(pwd)/toolchain-aarch64_cortex-a53_gcc-8.4.0_musl /opt/
-
-      - name: Compile 360T7
-        working-directory: ./swrt-gpl/release/src-mtk-arm
-        run: make swrt-swrt360t7
-
-      - name: Upload firmware
+      - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: SWRT-360T7-Firmware
+          name: SWRT-360T7-Build-Output
           path: swrt-gpl/release/src-mtk-arm/image/
           retention-days: 7
