@@ -1,0 +1,40 @@
+name: Build SWRT 360T7 (swrt-gpl official)
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: Fix /bin/sh to bash
+        run: sudo ln -sf /bin/bash /bin/sh
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential asciidoc binutils bison bzip2 gawk gettext git libncurses5-dev libz-dev patch python3 python2 unzip zlib1g-dev lib32gcc-s1 libc6-dev-i386 subversion flex uglifyjs git-core gcc-multilib p7zip p7zip-full msmtp libssl-dev texinfo libglib2.0-dev xmlto qemu-utils upx libelf-dev autoconf automake libtool autopoint device-tree-compiler g++-multilib antlr3 gperf wget libncurses5 libelf1 lib32z1 lib32stdc++6 gtk-doc-tools intltool binutils-dev cmake lzma liblzma-dev lzma-dev uuid-dev liblzo2-dev xsltproc dos2unix libstdc++6 sharutils autogen shtool
+
+      - name: Clone swrt-gpl
+        run: git clone --depth=1 https://github.com/SWRT-dev/swrt-gpl.git
+
+      - name: Clone mtk-toolchains
+        run: git clone --depth=1 https://github.com/SWRT-dev/mtk-toolchains.git
+
+      - name: Link toolchain to /opt
+        run: |
+          cd mtk-toolchains
+          sudo ln -sf $(pwd)/toolchain-aarch64_cortex-a53_gcc-8.4.0_musl /opt/
+
+      - name: Compile 360T7
+        working-directory: ./swrt-gpl/release/src-mtk-arm
+        run: make swrt-swrt360t7
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: SWRT-360T7-Firmware
+          path: swrt-gpl/release/src-mtk-arm/image/
+          retention-days: 7
