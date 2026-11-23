@@ -4,15 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       upload_release:
-        description: '上传到 Release'
+        description: '编译完成后发布到 Release'
         required: true
         default: 'true'
+        type: boolean
 
 env:
   TZ: Asia/Shanghai
+  WORK: /workdir
   SWRT_REPO: https://github.com/SWRT-dev/swrt-gpl
   TOOLCHAIN_REPO: https://github.com/SWRT-dev/mtk-toolchains
   TOOLCHAIN_DIR: toolchain-aarch64_cortex-a53_gcc-8.4.0_musl
+  TARGET: swrt-swrt360t7
 
 jobs:
   build:
@@ -20,69 +23,87 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Checkout 本仓库（放 diy 脚本用，可留空）
+      - name: Checkout（仅用于携带 diy 脚本，可留空）
         uses: actions/checkout@v4
 
       - name: 清理 Runner 空间
         run: |
-          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          df -hT $PWD
+          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet \
+                      /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          df -hT
 
       - name: 安装编译依赖
         run: |
           sudo apt-get update
-          sudo apt-get -y install \
+          sudo apt-get -y install --no-install-recommends \
             build-essential asciidoc binutils bison bzip2 gawk gettext git \
-            libncurses5-dev libz-dev patch python3 python2 unzip zlib1g-dev \
-            lib32gcc-s1 libc6-dev-i386 subversion flex uglifyjs git-core \
+            libncurses5-dev libz-dev patch python3 python2-minimal unzip \
+            zlib1g-dev lib32gcc-s1 libc6-dev-i386 subversion flex git-core \
             gcc-multilib p7zip p7zip-full msmtp libssl-dev texinfo \
             libglib2.0-dev xmlto qemu-utils upx libelf-dev autoconf automake \
             libtool autopoint device-tree-compiler g++-multilib antlr3 gperf \
             wget libncurses5 libelf1 lib32z1 lib32stdc++6 gtk-doc-tools \
             intltool binutils-dev cmake lzma liblzma-dev uuid-dev liblzo2-dev \
-            xsltproc dos2unix libstdc++5 docbook-xsl-* sharutils autogen \
-            shtool gengetopt libltdl-dev libtool-bin pkg-config libsysfs-dev
+            xsltproc dos2unix libstdc++6 docbook-xsl-nons sharutils autogen \
+            shtool gengetopt libltdl-dev libtool-bin pkg-config
+          sudo apt-get clean
+          df -hT
+
+      - name: 克隆源码 + 挂载工具链 + 编译 360T7
+        run: |
+          set -e
+          export FORCE_UNSAFE_CONFIGURE=1
+
+          # SWRT 文档要求：不要用 root 编译，且 /bin/sh 需指向 bash
           sudo ln -sf /bin/bash /bin/sh
+          sudo mkdir -p "$WORK"
+          sudo chown -R "$(id -u):$(id -g)" "$WORK"
 
-      - name: 克隆 SWRT 源码
-        working-directory: /workdir
-        run: |
-          mkdir -p /workdir
-          git clone ${{ env.SWRT_REPO }} swrt-gpl
-          git clone ${{ env.TOOLCHAIN_REPO }} mtk-toolchains
+          cd "$WORK"
+          echo "== 当前目录: $(pwd) =="
+          git clone --depth 1 "$SWRT_REPO" swrt-gpl
+          git clone --depth 1 "$TOOLCHAIN_REPO" mtk-toolchains
 
-      - name: 挂载工具链到 /opt
-        working-directory: /workdir/mtk-toolchains
-        run: |
-          TOOL=$(pwd)/${{ env.TOOLCHAIN_DIR }}
-          echo "TOOLCHAIN=$TOOL"
-          sudo ln -sf "$TOOL" /opt/
-          ls -l /opt/ | grep toolchain-aarch64
+          echo "== 工具链目录实际内容 =="
+          ls -lh mtk-toolchains/
+          if [ ! -d "mtk-toolchains/$TOOLCHAIN_DIR" ]; then
+            echo "::error::未找到 $TOOLCHAIN_DIR，请对照上面列表修正 TOOLCHAIN_DIR"
+            exit 1
+          fi
 
-      - name: 编译 360T7 (SWRT)
-        working-directory: /workdir/swrt-gpl/release/src-mtk-arm
-        run: |
-          # 非 root 编译（GitHub runner 默认就是普通用户，别用 sudo 切 root）
-          make swrt-swrt360t7 -j$(nproc) || make swrt-swrt360t7 -j1 V=s
+          sudo ln -sf "$(pwd)/mtk-toolchains/$TOOLCHAIN_DIR" /opt/
+          ls -l /opt/ | grep aarch64 || true
 
-      - name: 列出产物
-        working-directory: /workdir/swrt-gpl/release/src-mtk-arm/image
-        run: |
-          ls -lh
-          echo "FIRMWARE_PATH=$(pwd)" >> $GITHUB_ENV
+          # ---- 可选：DIY 补丁（改默认 IP / 主机名 / 追加包）----
+          # cd "$WORK/swrt-gpl"
+          # sed -i 's/192\.168\.1\.1/192.168.50.1/g' ...
+          # ----------------------------------------------------
+
+          cd "$WORK/swrt-gpl/release/src-mtk-arm"
+          echo "== 目标确认 =="
+          grep -n "$TARGET" Makefile | head -5 || true
+
+          echo "== 开始编译 $TARGET =="
+          make "$TARGET" -j"$(nproc)" || make "$TARGET" -j1 V=s
+
+          echo "== 产物 =="
+          ls -lh image/
+          echo "IMGDIR=$WORK/swrt-gpl/release/src-mtk-arm/image" >> "$GITHUB_ENV"
 
       - name: 上传到 Actions Artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: swrt-360t7
-          path: ${{ env.FIRMWARE_PATH }}
+          name: swrt-360t7-${{ github.run_number }}
+          path: ${{ env.IMGDIR }}
+          if-no-files-found: warn
 
       - name: 发布到 Release
-        if: ${{ github.event.inputs.upload_release == 'true' }}
+        if: ${{ inputs.upload_release }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: swrt-360t7-${{ github.run_number }}
-          name: SWRT 360T7 ${{ github.run_number }}
-          files: ${{ env.FIRMWARE_PATH }}/*
+          name: SWRT 360T7 #${{ github.run_number }}
+          files: ${{ env.IMGDIR }}/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
