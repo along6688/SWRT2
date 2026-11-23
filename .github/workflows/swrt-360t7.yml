@@ -23,8 +23,8 @@ permissions:
   packages: write
 
 env:
-  REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x-25.12
-  REPO_BRANCH: immortalwrt-25.12
+  REPO_URL: https://github.com/tfnhui/immortalwrt-mt798x-25.12
+  REPO_BRANCH: "25.12"
   CONFIG_FILE: seed.config
   DIY_SH_1: diy-part1.sh
   DIY_SH_2: diy-part2.sh
@@ -69,9 +69,14 @@ jobs:
 
       - name: 拉取源码
         working-directory: /workdir
+        env:
+          GIT_TERMINAL_PROMPT: "0"
         run: |
           df -hT $PWD
-          git clone --depth 1 -b $REPO_BRANCH $REPO_URL openwrt
+          echo "克隆源码：$REPO_URL (branch $REPO_BRANCH)"
+          git clone --depth 1 -b "$REPO_BRANCH" "$REPO_URL.git" openwrt || \
+          git clone --depth 1 -b "$REPO_BRANCH" "$REPO_URL" openwrt
+          test -d openwrt/.git || { echo "::error::源码克隆失败，请检查仓库地址与分支是否正确"; exit 1; }
           ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
       - name: 应用 diy-part1
