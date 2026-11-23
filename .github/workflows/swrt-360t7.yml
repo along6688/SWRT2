@@ -1,45 +1,88 @@
-name: Build SWRT 360T7 (swrt-gpl)
+name: Build SWRT 360T7
+
 on:
   workflow_dispatch:
-  push:
-    branches: [ master ]
+    inputs:
+      upload_release:
+        description: '上传到 Release'
+        required: true
+        default: 'true'
+
+env:
+  TZ: Asia/Shanghai
+  SWRT_REPO: https://github.com/SWRT-dev/swrt-gpl
+  TOOLCHAIN_REPO: https://github.com/SWRT-dev/mtk-toolchains
+  TOOLCHAIN_DIR: toolchain-aarch64_cortex-a53_gcc-8.4.0_musl
 
 jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 360
-    steps:
-      - name: Fix /bin/sh point to bash
-        run: sudo ln -sf /bin/bash /bin/sh
 
-      - name: Install build dependencies
+    steps:
+      - name: Checkout 本仓库（放 diy 脚本用，可留空）
+        uses: actions/checkout@v4
+
+      - name: 清理 Runner 空间
+        run: |
+          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -hT $PWD
+
+      - name: 安装编译依赖
         run: |
           sudo apt-get update
-          sudo apt-get -y install build-essential asciidoc binutils bison bzip2 gawk gettext git libncurses5-dev libz-dev patch python3 python2 unzip zlib1g-dev lib32gcc-s1 libc6-dev-i386 subversion flex uglifyjs git-core gcc-multilib p7zip p7zip-full msmtp libssl-dev texinfo libglib2.0-dev xmlto qemu-utils upx libelf-dev autoconf automake libtool autopoint device-tree-compiler g++-multilib antlr3 gperf wget libncurses5 libelf1 lib32z1 lib32stdc++6 gtk-doc-tools intltool binutils-dev cmake lzma liblzma-dev lzma-dev uuid-dev liblzo2-dev xsltproc dos2unix libstdc++6 sharutils autogen shtool
+          sudo apt-get -y install \
+            build-essential asciidoc binutils bison bzip2 gawk gettext git \
+            libncurses5-dev libz-dev patch python3 python2 unzip zlib1g-dev \
+            lib32gcc-s1 libc6-dev-i386 subversion flex uglifyjs git-core \
+            gcc-multilib p7zip p7zip-full msmtp libssl-dev texinfo \
+            libglib2.0-dev xmlto qemu-utils upx libelf-dev autoconf automake \
+            libtool autopoint device-tree-compiler g++-multilib antlr3 gperf \
+            wget libncurses5 libelf1 lib32z1 lib32stdc++6 gtk-doc-tools \
+            intltool binutils-dev cmake lzma liblzma-dev uuid-dev liblzo2-dev \
+            xsltproc dos2unix libstdc++5 docbook-xsl-* sharutils autogen \
+            shtool gengetopt libltdl-dev libtool-bin pkg-config libsysfs-dev
+          sudo ln -sf /bin/bash /bin/sh
 
-      - name: Clone swrt-gpl repository
-        run: git clone --depth=1 https://github.com/SWRT-dev/swrt-gpl.git
-
-      - name: Clone mtk-toolchains repository
-        run: git clone --depth=1 https://github.com/SWRT-dev/mtk-toolchains.git
-
-      - name: Configure git global identity  # 修复 fatal: empty ident name
+      - name: 克隆 SWRT 源码
+        working-directory: /workdir
         run: |
-          git config --global user.name "github-actions"
-          git config --global user.email "actions@github.com"
+          mkdir -p /workdir
+          git clone ${{ env.SWRT_REPO }} swrt-gpl
+          git clone ${{ env.TOOLCHAIN_REPO }} mtk-toolchains
 
-      - name: Link mtk toolchain to /opt
+      - name: 挂载工具链到 /opt
+        working-directory: /workdir/mtk-toolchains
         run: |
-          cd mtk-toolchains
-          sudo ln -sf $(pwd)/toolchain-aarch64_cortex-a53_gcc-8.4.0_musl /opt/
+          TOOL=$(pwd)/${{ env.TOOLCHAIN_DIR }}
+          echo "TOOLCHAIN=$TOOL"
+          sudo ln -sf "$TOOL" /opt/
+          ls -l /opt/ | grep toolchain-aarch64
 
-      - name: Start compile target swrt-swrt360t7
-        working-directory: ./swrt-gpl/release/src-mtk-arm
-        run: make swrt-swrt360t7
+      - name: 编译 360T7 (SWRT)
+        working-directory: /workdir/swrt-gpl/release/src-mtk-arm
+        run: |
+          # 非 root 编译（GitHub runner 默认就是普通用户，别用 sudo 切 root）
+          make swrt-swrt360t7 -j$(nproc) || make swrt-swrt360t7 -j1 V=s
 
-      - name: Upload firmware artifacts
+      - name: 列出产物
+        working-directory: /workdir/swrt-gpl/release/src-mtk-arm/image
+        run: |
+          ls -lh
+          echo "FIRMWARE_PATH=$(pwd)" >> $GITHUB_ENV
+
+      - name: 上传到 Actions Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: SWRT-360T7-Build-Output
-          path: swrt-gpl/release/src-mtk-arm/image/
-          retention-days: 7
+          name: swrt-360t7
+          path: ${{ env.FIRMWARE_PATH }}
+
+      - name: 发布到 Release
+        if: ${{ github.event.inputs.upload_release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: swrt-360t7-${{ github.run_number }}
+          name: SWRT 360T7 ${{ github.run_number }}
+          files: ${{ env.FIRMWARE_PATH }}/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
