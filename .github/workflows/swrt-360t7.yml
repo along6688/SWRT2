@@ -15,8 +15,6 @@ env:
   SWRT_REPO: https://github.com/SWRT-dev/swrt-gpl
   TOOLCHAIN_REPO: https://github.com/SWRT-dev/mtk-toolchains
   TOOLCHAIN_DIR: toolchain-aarch64_cortex-a53_gcc-8.4.0_musl
-  TARGET: swrt-swrt360t7
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
@@ -24,106 +22,81 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Checkout（携带 diy 脚本，可留空）
+      - name: Checkout（仅用于携带 diy 脚本，可留空）
         uses: actions/checkout@v4
 
       - name: 清理 Runner 空间
         run: |
           sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet \
-                      /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+                      /usr/local/lib/android /opt/ghc
           df -hT
 
-      - name: 启用 32 位架构支持（关键修复）
-        run: |
-          set -e
-          sudo dpkg --add-architecture i386
-          sudo apt-get update
-          # swrt-gpl 的 src/router 一套 libnetfilter_* 在 host 侧按 32 位构建，
-          # 缺 ia32 运行库会导致 "C compiler cannot create executables"
-          sudo apt-get -y install --no-install-recommends \
-            gcc-multilib g++-multilib \
-            libc6-dev-i386 libc6-i386 lib32gcc-s1 lib32stdc++6 lib32z1 \
-            lib32z1-dev lib32ncurses5 libncurses5:i386
-          sudo apt-get clean
-
-      - name: 安装编译依赖（照抄 SWRT 官方依赖表）
+      - name: 安装编译依赖（此清单已在 ubuntu-22.04 上实测安装成功）
         run: |
           set -e
           sudo ln -sf /bin/bash /bin/sh
           sudo apt-get update
           sudo apt-get -y install --no-install-recommends \
             build-essential asciidoc binutils bison bzip2 gawk gettext git \
-            libncurses5-dev libz-dev patch python3 python2 unzip zlib1g-dev \
-            lib32gcc-s1 libc6-dev-i386 subversion flex uglifyjs git-core \
+            libncurses5-dev libz-dev patch python3 python2-minimal unzip \
+            zlib1g-dev lib32gcc-s1 libc6-dev-i386 subversion flex git-core \
             gcc-multilib p7zip p7zip-full msmtp libssl-dev texinfo \
             libglib2.0-dev xmlto qemu-utils upx libelf-dev autoconf automake \
             libtool autopoint device-tree-compiler g++-multilib antlr3 gperf \
             wget libncurses5 libelf1 lib32z1 lib32stdc++6 gtk-doc-tools \
-            intltool binutils-dev cmake lzma liblzma-dev lzma-dev uuid-dev \
-            liblzo2-dev xsltproc dos2unix libstdc++6 docbook-xsl-nons \
-            sharutils autogen shtool gengetopt libltdl-dev libtool-bin \
-            pkg-config libsysfs-dev
+            intltool binutils-dev cmake lzma liblzma-dev uuid-dev liblzo2-dev \
+            xsltproc dos2unix libstdc++6 docbook-xsl-nons sharutils autogen \
+            shtool gengetopt libltdl-dev libtool-bin pkg-config
           sudo apt-get clean
           df -hT
+
+      - name: 配置 git 身份（SDK 打包阶段会写 git 版本号）
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
 
       - name: 克隆源码 + 挂载工具链 + 编译 360T7
         run: |
           set -e
-          export FORCE_UNSAFE_CONFIGURE=1
-          export PATH="/opt/$TOOLCHAIN_DIR/bin:$PATH"
 
           sudo mkdir -p "$WORK"
           sudo chown -R "$(id -u):$(id -g)" "$WORK"
           cd "$WORK"
-          echo "== 当前目录: $(pwd) =="
 
-          git clone --depth 1 "$SWRT_REPO" swrt-gpl
+          git clone "$SWRT_REPO" swrt-gpl
           git clone --depth 1 "$TOOLCHAIN_REPO" mtk-toolchains
 
-          echo "== 工具链目录实际内容 =="
+          git -C swrt-gpl rev-parse -q --verify "refs/tags/asuswrt_4.0.0.4.386rc4" >/dev/null \
+            || git -C swrt-gpl tag asuswrt_4.0.0.4.386rc4 HEAD
+
+          echo "== 工具链目录 =="
           ls -lh mtk-toolchains/
           if [ ! -d "mtk-toolchains/$TOOLCHAIN_DIR" ]; then
-            echo "::error::未找到 $TOOLCHAIN_DIR，请对照上面列表修正 TOOLCHAIN_DIR"
+            echo "::error::未找到 $TOOLCHAIN_DIR"
             exit 1
           fi
 
-          sudo ln -sf "$(pwd)/mtk-toolchains/$TOOLCHAIN_DIR" /opt/
-          ls -l /opt/ | grep aarch64 || true
-
-          # ---- 32 位工具链自检（本次失败的根因，先验证再编译）----
-          echo "== 32 位 host 工具链自检 =="
-          echo 'int main(){return 0;}' > /tmp/t.c
-          gcc -m32 -o /tmp/t32 /tmp/t.c && echo "gcc -m32 OK" \
-            || echo "::warning::gcc -m32 仍不可用，libnetfilter_* 可能再次失败"
-          rm -f /tmp/t.c /tmp/t32
-
-          # ---- 可选：DIY 补丁 ----
-          # cd "$WORK/swrt-gpl"
-          # sed -i 's/192\.168\.1\.1/192.168.50.1/g' release/src-mtk-arm/router/httpd/...
-          # --------------------
+          cd mtk-toolchains
+          sudo ln -sf "$(pwd)/$TOOLCHAIN_DIR" /opt/
+          cd ..
+          ls -l /opt/ | grep aarch64
 
           cd "$WORK/swrt-gpl/release/src-mtk-arm"
-          echo "== target 确认 =="
-          grep -n "$TARGET" Makefile | head -5 || true
 
-          # 先单线程把 host 工具链/头文件类依赖铺稳，再全速并行
-          echo "== 第一阶段：单线程铺 host 依赖 =="
-          make "$TARGET" -j1 || true
-
-          echo "== 第二阶段：全速并行 =="
-          make "$TARGET" -j"$(nproc)" || make "$TARGET" -j1 V=s
+          echo "== 开始编译 swrt-swrt360t7（单线程，照官方流程）=="
+          make swrt-swrt360t7
 
           echo "== 产物 =="
-          ls -lh image/ || true
-          echo "IMGDIR=$WORK/swrt-gpl/release/src-mtk-arm/image" >> "$GITHUB_ENV"
+          test -d image
+          ls -lh image/
 
       - name: 上传到 Actions Artifacts
         if: ${{ success() }}
         uses: actions/upload-artifact@v4
         with:
           name: swrt-360t7-${{ github.run_number }}
-          path: ${{ env.IMGDIR != '' && env.IMGDIR || github.workspace }}
-          if-no-files-found: warn
+          path: /workdir/swrt-gpl/release/src-mtk-arm/image
+          if-no-files-found: error
 
       - name: 发布到 Release
         if: ${{ success() && inputs.upload_release }}
@@ -131,6 +104,6 @@ jobs:
         with:
           tag_name: swrt-360t7-${{ github.run_number }}
           name: SWRT 360T7 #${{ github.run_number }}
-          files: ${{ env.IMGDIR }}/*
+          files: /workdir/swrt-gpl/release/src-mtk-arm/image/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
