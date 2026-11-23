@@ -1,4 +1,4 @@
-name: Build 360T7 25.12 Closed
+name: Build 360T7 25.12 Closed (Clean/No-Plugin)
 
 on:
   workflow_dispatch:
@@ -83,6 +83,16 @@ jobs:
         run: |
           [ -f "$DIY_SH_1" ] && bash "$DIY_SH_1" "$GITHUB_WORKSPACE/openwrt" || true
 
+      - name: 清理问题 feed（内联，必定执行）
+        working-directory: openwrt
+        run: |
+          echo "===== 处理前 feeds.conf.default ====="
+          cat feeds.conf.default 2>/dev/null || true
+          sed -i '/adguardhome/Id; /openclash/Id; /helloworld/Id; /kenzok8/Id; /istoreos/Id; /liuran001/Id; /small/Id; /passwall/Id' feeds.conf.default 2>/dev/null || true
+          rm -rf feeds/adguardhome feeds/adguardhome.tmp feeds/openclash feeds/openclash.tmp
+          echo "===== 处理后 feeds.conf.default（应只剩官方源）====="
+          cat feeds.conf.default
+
       - name: 更新 feeds
         run: |
           cd openwrt
@@ -132,7 +142,7 @@ jobs:
         if: steps.organize.outputs.status == 'success'
         with:
           tag_name: build-${{ env.FILE_DATE }}
-          name: 360T7 ImmortalWrt 25.12 Closed ${{ env.FILE_DATE }}
+          name: 360T7 ImmortalWrt 25.12 Closed Clean ${{ env.FILE_DATE }}
           files: ${{ env.FIRMWARE }}/*
 
       - name: 开启调试
