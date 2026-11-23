@@ -1,109 +1,54 @@
-name: Build SWRT 360T7
-
+name: Build ImmortalWrt 25.12 360T7 闭源驱动
 on:
   workflow_dispatch:
-    inputs:
-      upload_release:
-        description: '编译完成后发布到 Release'
-        required: true
-        default: 'true'
-        type: boolean
-
+  push:
+    branches: [ main ]
 env:
+  REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x-25.12
+  REPO_BRANCH: main
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: configs/360t7-mtwifi.config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  UPLOAD_FIRMWARE: true
+  UPLOAD_BIN_DIR: false
   TZ: Asia/Shanghai
-  WORK: /workdir
-  SWRT_REPO: https://github.com/SWRT-dev/swrt-gpl
-  TOOLCHAIN_REPO: https://github.com/SWRT-dev/mtk-toolchains
-  TOOLCHAIN_DIR: toolchain-aarch64_cortex-a53_gcc-8.4.0_musl
-
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 360
-
     steps:
-      - name: Checkout（仅用于携带 diy 脚本，可留空）
+      - name: Checkout
         uses: actions/checkout@v4
-
-      - name: 清理 Runner 空间
+      - name: Initialization environment
         run: |
-          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet \
-                      /usr/local/lib/android /opt/ghc
-          df -hT
-
-      - name: 安装编译依赖（此清单已在 ubuntu-22.04 上实测安装成功）
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt update
+          sudo apt install -y build-essential libncurses-dev gawk flex bison qemu-utils git gettext
+      - name: Clone source
         run: |
-          set -e
-          sudo ln -sf /bin/bash /bin/sh
-          sudo apt-get update
-          sudo apt-get -y install --no-install-recommends \
-            build-essential asciidoc binutils bison bzip2 gawk gettext git \
-            libncurses5-dev libz-dev patch python3 python2-minimal unzip \
-            zlib1g-dev lib32gcc-s1 libc6-dev-i386 subversion flex git-core \
-            gcc-multilib p7zip p7zip-full msmtp libssl-dev texinfo \
-            libglib2.0-dev xmlto qemu-utils upx libelf-dev autoconf automake \
-            libtool autopoint device-tree-compiler g++-multilib antlr3 gperf \
-            wget libncurses5 libelf1 lib32z1 lib32stdc++6 gtk-doc-tools \
-            intltool binutils-dev cmake lzma liblzma-dev uuid-dev liblzo2-dev \
-            xsltproc dos2unix libstdc++6 docbook-xsl-nons sharutils autogen \
-            shtool gengetopt libltdl-dev libtool-bin pkg-config
-          sudo apt-get clean
-          df -hT
-
-      - name: 配置 git 身份（SDK 打包阶段会写 git 版本号）
+          git clone --depth=1 -b ${{ env.REPO_BRANCH }} ${{ env.REPO_URL }} openwrt
+          cd openwrt
+          cp ../${{ env.FEEDS_CONF }} feeds.conf.default
+      - name: Feeds update & install
         run: |
-          git config --global user.name "GitHub Actions"
-          git config --global user.email "actions@github.com"
-
-      - name: 克隆源码 + 挂载工具链 + 编译 360T7
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+      - name: Load config
         run: |
-          set -e
-
-          sudo mkdir -p "$WORK"
-          sudo chown -R "$(id -u):$(id -g)" "$WORK"
-          cd "$WORK"
-
-          git clone "$SWRT_REPO" swrt-gpl
-          git clone --depth 1 "$TOOLCHAIN_REPO" mtk-toolchains
-
-          git -C swrt-gpl rev-parse -q --verify "refs/tags/asuswrt_4.0.0.4.386rc4" >/dev/null \
-            || git -C swrt-gpl tag asuswrt_4.0.0.4.386rc4 HEAD
-
-          echo "== 工具链目录 =="
-          ls -lh mtk-toolchains/
-          if [ ! -d "mtk-toolchains/$TOOLCHAIN_DIR" ]; then
-            echo "::error::未找到 $TOOLCHAIN_DIR"
-            exit 1
-          fi
-
-          cd mtk-toolchains
-          sudo ln -sf "$(pwd)/$TOOLCHAIN_DIR" /opt/
-          cd ..
-          ls -l /opt/ | grep aarch64
-
-          cd "$WORK/swrt-gpl/release/src-mtk-arm"
-
-          echo "== 开始编译 swrt-swrt360t7（单线程，照官方流程）=="
-          make swrt-swrt360t7
-
-          echo "== 产物 =="
-          test -d image
-          ls -lh image/
-
-      - name: 上传到 Actions Artifacts
-        if: ${{ success() }}
+          cd openwrt
+          cp ../${{ env.CONFIG_FILE }} .config
+          make defconfig
+      - name: DIY Part1
+        run: |
+          chmod +x ${{ env.DIY_P1_SH }}
+          ./${{ env.DIY_P1_SH }}
+      - name: Compile firmware
+        run: |
+          cd openwrt
+          make -j$(nproc)
+      - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
-          name: swrt-360t7-${{ github.run_number }}
-          path: /workdir/swrt-gpl/release/src-mtk-arm/image
-          if-no-files-found: error
-
-      - name: 发布到 Release
-        if: ${{ success() && inputs.upload_release }}
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: swrt-360t7-${{ github.run_number }}
-          name: SWRT 360T7 #${{ github.run_number }}
-          files: /workdir/swrt-gpl/release/src-mtk-arm/image/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: 360T7-25.12-mtwifi
+          path: openwrt/bin/targets/mt798x/mt7981/
