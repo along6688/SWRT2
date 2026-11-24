@@ -1,6 +1,8 @@
 name: Build 360T7 ImmortalWrt
 on:
   workflow_dispatch:
+  push:
+    branches: [ main ]
 
 jobs:
   build:
@@ -19,7 +21,7 @@ jobs:
           sudo apt update
           sudo apt install -y build-essential libncurses5-dev libncursesw5-dev zlib1g-dev gawk git gettext libssl-dev xsltproc rsync wget curl bzip2 flex bison ccache
 
-      - name: 直接生成 .config + 镜像加速feeds
+      - name: 直接生成 .config + ghproxy加速feeds
         run: |
           cat > openwrt/.config <<'EOF'
 #
