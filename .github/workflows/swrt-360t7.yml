@@ -88,17 +88,20 @@ jobs:
           echo 'CONFIG_PACKAGE_samba4=n' >> openwrt/.config
           echo 'CONFIG_PACKAGE_luci-app-samba4=n' >> openwrt/.config
 
-          cd openwrt
-          sed -i '/kenzo/d' feeds.conf.default
-          sed -i '/small/d' feeds.conf.default
-          sed -i '$a src-git kenzo https://github.com/kenzok8/openwrt-packages.git' feeds.conf.default
-          sed -i '$a src-git small https://github.com/kenzok8/small.git' feeds.conf.default
-          git config --global url."https://mirror.ghproxy.com/https://github.com/".insteadOf "https://github.com/"
+      - name: 克隆第三方插件包（绕过feeds）
+        run: |
+          cd openwrt/package
+          # 浅克隆插件仓库，失败自动重试
+          git clone --depth=1 https://github.com/kenzok8/openwrt-packages.git kenzo || git clone --depth=1 https://github.com/kenzok8/openwrt-packages.git kenzo
+          git clone --depth=1 https://github.com/kenzok8/small.git small || git clone --depth=1 https://github.com/kenzok8/small.git small
+          # 验证目录
+          ls -la kenzo
+          ls -la small
 
-      - name: 更新并安装 feeds
+      - name: 更新并安装官方 feeds
         run: |
           cd openwrt
-          ./scripts/feeds update -a
+          ./scripts/feeds update -a || ./scripts/feeds update -a
           ./scripts/feeds install -a
 
       - name: 加载配置
