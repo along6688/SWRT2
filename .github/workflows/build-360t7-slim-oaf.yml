@@ -3,6 +3,7 @@ name: Build ImmortalWrt mt798x - 360T7 slim (EQoS + AppFilter/OAF)
 # 精简版：去掉 AdGuard Home，改用 AppFilter(OpenAppFilter)，并把 kmod-oaf 直接编进固件
 #
 # 用法：
+#   0. 本文件路径：.github/workflows/build-immortalwrt-360t7-slim.yml
 #   1. 任意一个你自己的仓库（不需要 fork，空仓库只放这个文件也能跑）
 #   2. 本文件放到 .github/workflows/ 下，提交到默认分支
 #   3. Actions -> Run workflow（或等每天定时自动跑）
@@ -60,7 +61,7 @@ env:
   REPO_BASE_CONFIG: defconfig/mt7981-ax3000.config
 
 concurrency:
-  group: build-360t7-slim-oaf
+  group: build-immortalwrt-360t7-slim
   cancel-in-progress: false
 
 jobs:
@@ -76,15 +77,30 @@ jobs:
         id: latest
         run: |
           set -e
-          SHA=$(curl -sS --retry 3 --max-time 60 \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            "https://api.github.com/repos/$UPSTREAM/commits?sha=$UPSTREAM_BRANCH&per_page=1" \
-            | jq -r '.[0].sha')
-          if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
-            echo "::error::取不到上游 $UPSTREAM/$UPSTREAM_BRANCH 的最新 commit"
+          # 主路径：git 协议直接读分支 ref —— 免鉴权、无 API 限流、不依赖 jq
+          SHA=$(git ls-remote "https://github.com/$UPSTREAM.git" "refs/heads/$UPSTREAM_BRANCH" \
+            | awk '{print $1}' | head -1)
+
+          # 兜底：公开仓库匿名调 API 就够（未鉴权限流 60 次/小时，一天一次绰绰有余）
+          if [ -z "$SHA" ]; then
+            echo "git ls-remote 未取到 ref，改用 REST API 兜底"
+            SHA=$(curl -sS --retry 3 --max-time 60 \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$UPSTREAM/commits?sha=$UPSTREAM_BRANCH&per_page=1" \
+              | jq -r 'if type=="array" then (.[0].sha // empty) else empty end')
+          fi
+
+          # 硬校验：必须 40 位十六进制，避免把 API 的错误对象当成 commit（上次就是栽在这）
+          case "$SHA" in
+            ''|*[!0-9a-fA-F]*)
+              echo "::error::上游 commit 取值异常：[$SHA]，请确认分支 $UPSTREAM_BRANCH 是否存在"
+              exit 1 ;;
+          esac
+          if [ ${#SHA} -ne 40 ]; then
+            echo "::error::commit SHA 长度异常（${#SHA}）：$SHA"
             exit 1
           fi
+
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "sha8=${SHA:0:8}" >> "$GITHUB_OUTPUT"
           echo "上游最新：$UPSTREAM @ ${SHA:0:8} ($UPSTREAM_BRANCH)"
