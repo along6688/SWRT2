@@ -1,21 +1,19 @@
 name: Build ImmortalWrt mt798x - 360T7 (auto track upstream)
 
 # 用途：
-#   每天定时检查上游 chasey-dev/immortalwrt-mt798x-rebase 是否有新提交，
-#   有更新才编译 360T7 固件（内置 AdGuard Home + EQoS），没更新就直接跳过、不占 runner 时间。
-#   编译的是上游最新源码，不需要你手动 Sync fork。
+#   每天定时检查上游 chasey-dev/immortalwrt-mt798x-rebase 的 25.12 分支有没有新提交，
+#   有更新才编译 360T7 固件（内置 AdGuard Home + EQoS），没更新直接跳过、不烧 runner 时间。
 #
 # 用法：
-#   1. Fork chasey-dev/immortalwrt-mt798x-rebase（默认分支 25.12）
-#   2. 本文件放到你 fork 的 .github/workflows/ 下，提交进默认分支
-#   3. Actions 页面确认 "Workflows are inactive" 之类提示已解除（新 fork 需手动一次 Enable workflows）
-#   4. 之后每天自动跑；也可以随时 Run workflow 手动触发（勾选 Force build 可无视上游更新强行编）
+#   1. 任意一个你自己的仓库（不需要 fork，空仓库只放这个文件也能跑）
+#   2. 本文件放进 .github/workflows/ 并提交到默认分支
+#   3. Actions 页面点一次 "Set up a workflow / Enable workflows"（新仓库不启用则 schedule 不触发）
 #
 # 注意：
-#   - cron 用 UTC：下面 '0 1 * * *' = 北京时间 09:00；改成 '0 1,9 * * *' 就是每天两次
-#   - GitHub 对 fork 仓库的 schedule 有 60 天不活跃自动停用机制：偶尔手动跑一次或 push 一下即可
-#   - 只在编译成功后才记录"已编译到的上游 commit"，失败的话下一次仍会自动重试
-#   - 上游机型来自 target/linux/mediatek/image/filogic.mk：qihoo_360t7 / qihoo_360t7-ubi
+#   - cron 用 UTC："0 1 * * *" = 北京时间 09:00；想一天两次改 "0 1,9 * * *"
+#   - GitHub 对 fork 仓库的 schedule 有 60 天不活跃自动停用；自己的独立仓库不受此限制
+#   - 只有编译成功才记录"已编到哪个上游 commit"，失败的话下次自动重试
+#   - detect-update 这个 job 只跑十几秒，绝大多数无更新的日子就它一个人跑完收工
 
 on:
   workflow_dispatch:
@@ -55,14 +53,14 @@ on:
 env:
   UPSTREAM: chasey-dev/immortalwrt-mt798x-rebase
   UPSTREAM_BRANCH: 25.12
+  SRC_DIR: openwrt
   REPO_BASE_CONFIG: defconfig/mt7981-ax3000.config
 
 concurrency:
-  group: build-immortalwrt-360t7
+  group: build-immortalwrt-360t7-auto
   cancel-in-progress: false
 
 jobs:
-  # 轻量探测：只看上游有没有新 commit，没有就把整个 build 任务跳过
   detect-update:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -100,17 +98,20 @@ jobs:
         id: cmp
         run: |
           PREV=""
-          if [ -f ci-state/last_built_sha ]; then
-            PREV=$(cat ci-state/last_built_sha)
-          fi
-          FORCE="${{ github.event.inputs.force_build }}"
-          if [ "$PREV" = "${{ steps.latest.outputs.sha }}" ] && [ "$FORCE" != "true" ]; then
-            echo "上游无新提交（上次已编译 ${PREV:0:8}），本次跳过"
+          [ -f ci-state/last_built_sha ] && PREV=$(cat ci-state/last_built_sha)
+          if [ "$PREV" = "$SHA" ] && [ "${{ github.event.inputs.force_build }}" != "true" ]; then
+            echo "上游无新提交（上次已编 ${PREV:0:8}），本次跳过编译"
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
-            [ -n "$PREV" ] && echo "检测到更新：${PREV:0:8} -> ${{ steps.latest.outputs.sha8 }}" || echo "首次运行，全量编译"
+            if [ -n "$PREV" ]; then
+              echo "检测到更新：${PREV:0:8} -> ${SHA:0:8}"
+            else
+              echo "首次运行，全量编译"
+            fi
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
+        env:
+          SHA: ${{ steps.latest.outputs.sha }}
 
   build:
     needs: detect-update
@@ -125,25 +126,12 @@ jobs:
       WITH_EQOS: ${{ github.event.inputs.enable_eqos != 'false' }}
       EXTRA_PKGS: ${{ github.event.inputs.extra_packages }}
       UPSTREAM_SHA: ${{ needs.detect-update.outputs.sha }}
+    defaults:
+      run:
+        working-directory: openwrt
     steps:
-      - name: 检出本仓库（取 workflow 文件与状态缓存）
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref }}
-          fetch-depth: 1
-
-      - name: 备份 workflows 目录（切到上游 commit 后会被移除）
-        run: cp -a .github /tmp/workflows-backup 2>/dev/null || true
-
-      - name: 切到上游最新源码
-        run: |
-          set -e
-          git fetch --depth 1 "https://github.com/$UPSTREAM.git" "$UPSTREAM_SHA"
-          git checkout -f FETCH_HEAD
-          git log -1 --oneline
-          test -f "$REPO_BASE_CONFIG" || { echo "::error::源码异常，缺少 $REPO_BASE_CONFIG"; exit 1; }
-
       - name: 释放磁盘空间
+        working-directory: .
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/share/swift || true
@@ -153,10 +141,11 @@ jobs:
           df -hT /
 
       - name: 安装编译依赖
+        working-directory: .
         run: |
           sudo -E apt-get -o Acquire::Retries=3 update
           # 逐个校验包名：runner 镜像里不存在或改过名的包直接跳过，
-          # 避免一个包名写错就把整轮编译拖挂（之前 python3-pyelfutils 就是这么挂的）
+          # 避免一个包名写错就把整轮编译拖挂
           PKGS="build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
           gettext git libncurses-dev libssl-dev libelf-dev python3-setuptools \
           python3-pyelftools rsync swig unzip zlib1g-dev file wget cmake time \
@@ -172,6 +161,25 @@ jobs:
           sudo -E DEBIAN_FRONTEND=noninteractive apt-get -y install $AVAIL
           sudo apt-get -qq autoremove --purge || true
 
+      - name: 拉取上游最新源码
+        working-directory: .
+        run: |
+          set -e
+          git config --global --add safe.directory '*'
+          # 只取 detect 阶段确认的那一个 commit，保证编的一定是最新源码
+          git init -q "$SRC_DIR"
+          git -C "$SRC_DIR" remote add origin "https://github.com/$UPSTREAM"
+          git -C "$SRC_DIR" fetch --depth 1 origin "$UPSTREAM_SHA"
+          git -C "$SRC_DIR" checkout -q -f FETCH_HEAD
+          git -C "$SRC_DIR" log -1 --format='源码 commit：%h %ci %s'
+          # 源码完整性自检，缺文件立刻报错，不要拖到后面报 No such file or directory
+          for f in scripts/feeds "$REPO_BASE_CONFIG" target/linux/mediatek/image/filogic.mk; do
+            test -e "$SRC_DIR/$f" || { echo "::error::源码异常，缺少 $f"; exit 1; }
+          done
+          grep -rqs "^define Device/${DEVICE}\$" "$SRC_DIR/target/linux/mediatek/image/" \
+            || { echo "::error::上游没有机型 ${DEVICE}，当前可选："; \
+                 grep -rhoE "qihoo_360t7[a-zA-Z0-9_.-]*" "$SRC_DIR/target/linux/mediatek/image/" | sort -u; exit 1; }
+
       - name: 更新并安装 feeds
         run: |
           ./scripts/feeds update -a
@@ -182,13 +190,6 @@ jobs:
           set -e
           rm -f .config
           cp -f "$REPO_BASE_CONFIG" .config
-
-          # 上游若改名/删机型，直接报错并列出可用机型，不产出空固件
-          if ! grep -rqs "^define Device/${DEVICE}\$" target/linux/mediatek/image/; then
-            echo "::error::上游源码中找不到机型 ${DEVICE}，当前可选 360T7 机型："
-            grep -rhoE "qihoo_360t7[a-zA-Z0-9_.-]*" target/linux/mediatek/image/ | sort -u
-            exit 1
-          fi
 
           # 基础配置里带了整机 mediatek 机型，清掉只留 360T7，省一大半编译时间
           sed -ri '/^CONFIG_TARGET_DEVICE(_PACKAGES)?_mediatek_filogic_DEVICE_/d' .config
@@ -205,8 +206,7 @@ jobs:
           EOF
           fi
 
-          # EQoS 用本仓库 MTK 方案自带的 eqos-mtk；
-          # 想要社区通用版改成：CONFIG_PACKAGE_luci-app-eqos=y / luci-i18n-eqos-zh-cn=y
+          # 想要社区通用版 EQoS：改成 luci-app-eqos / luci-i18n-eqos-zh-cn
           if [ "$WITH_EQOS" = "true" ]; then
             cat >> .config <<'EOF'
           CONFIG_PACKAGE_luci-app-eqos-mtk=y
@@ -223,10 +223,8 @@ jobs:
           echo "==== 机型与插件确认 ===="
           grep -E "^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_" .config || true
           for p in adguardhome luci-app-adguardhome luci-app-eqos-mtk; do
-            if ! grep -qs "^CONFIG_PACKAGE_${p}=y$" .config; then
-              echo "::error::插件 ${p} 未能选中（上游 feeds 依赖变动或收录变化），本次编译中止"
-              exit 1
-            fi
+            grep -qs "^CONFIG_PACKAGE_${p}=y$" .config \
+              || { echo "::error::插件 ${p} 未能选中（上游 feeds 依赖变动），本次编译中止"; exit 1; }
           done
           echo "OK：机型与插件检查通过"
 
@@ -250,7 +248,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: firmware-360t7-${{ env.DEVICE }}-${{ needs.detect-update.outputs.sha8 }}
-          path: out/
+          path: openwrt/out/
           retention-days: 14
           if-no-files-found: error
 
@@ -263,20 +261,22 @@ jobs:
           body: |
             上游 commit：${{ env.UPSTREAM_SHA }}
             机型：${{ env.DEVICE }} ｜ 插件：AdGuard Home + EQoS
-          files: out/*
+          files: openwrt/out/*
           prerelease: true
 
-      # 只有走到这一步（编译成功）才记录"已编到哪个上游 commit"
+      # 走到这里说明编译成功，才把"已编到哪个上游 commit"落盘（失败则下次自动重试）
       - name: 记录已编译的上游 commit
+        working-directory: .
+        run: |
+          mkdir -p ci-state
+          echo "$UPSTREAM_SHA" > ci-state/last_built_sha
+          cat ci-state/last_built_sha
+
+      - name: 保存状态缓存
+        working-directory: .
         uses: actions/cache@v4
         with:
           path: ci-state/
           key: ci-360t7-state-${{ github.run_id }}
           restore-keys: |
             ci-360t7-state-
-
-      - name: 写入状态文件
-        run: |
-          mkdir -p ci-state
-          echo "$UPSTREAM_SHA" > ci-state/last_built_sha
-          cat ci-state/last_built_sha
