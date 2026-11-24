@@ -1,0 +1,190 @@
+name: Build ImmortalWrt mt798x - 360T7
+
+# 用法：
+#   1. Fork chasey-dev/immortalwrt-mt798x-rebase（默认分支 25.12）到你自己的账号
+#   2. 把这个文件放到你 fork 的 .github/workflows/ 目录下，提交
+#   3. Actions -> "Build ImmortalWrt mt798x - 360T7" -> Run workflow
+#   4. 编译完成后在 Artifacts 里下载 firmware-360t7-xxxx（内含 sysupgrade.itb / fip / preloader / .config）
+#
+# 说明：
+#   - 机型来自 target/linux/mediatek/image/filogic.mk：
+#       qihoo_360t7        = 360T7（标准 UBI 分区方案，配合通用 mt7981 不死 uboot）
+#       qihoo_360t7-ubi    = 360T7 (UBI)（配套本仓库生成的 ubi 版 preloader/fip）
+#   - EQoS 用的是本仓库 MTK 闭源方案自带的 luci-app-eqos-mtk（硬件 QoS，自带中文界面）；
+#     若想要社区通用版 EQoS，把 eqos-mtk 换成 luci-app-eqos 即可（见下方 EQOS 段注释）。
+#   - AdGuard Home 是 Go 程序，编译较吃磁盘和内存，已做磁盘清理；若只想装插件，
+#     也可以在固件里留空，之后用 opkg 在线装。
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "360T7 分区方案（不清楚就选 qihoo_360t7）"
+        type: choice
+        default: qihoo_360t7
+        options:
+          - qihoo_360t7
+          - qihoo_360t7-ubi
+      enable_adguardhome:
+        description: "内置 AdGuard Home（含 LuCI 界面 + 中文语言包）"
+        type: boolean
+        default: true
+      enable_eqos:
+        description: "内置 EQoS 流量限速（luci-app-eqos-mtk）"
+        type: boolean
+        default: true
+      extra_packages:
+        description: "额外插件，空格分隔（例：luci-app-ddns luci-app-ttyd curl-util）"
+        required: false
+        type: string
+        default: ""
+      upload_release:
+        description: "编译完同时发布 GitHub Release"
+        type: boolean
+        default: false
+  # 需要定时自动编译时取消下面两行注释（每周一 04:00）
+  # schedule:
+  #   - cron: "0 4 * * 1"
+
+env:
+  REPO_BASE_CONFIG: defconfig/mt7981-ax3000.config
+  DEVICE: ${{ github.event.inputs.device || 'qihoo_360t7' }}
+  WITH_AGH: ${{ github.event.inputs.enable_adguardhome != 'false' }}
+  WITH_EQOS: ${{ github.event.inputs.enable_eqos != 'false' }}
+  EXTRA_PKGS: ${{ github.event.inputs.extra_packages }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      contents: write
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 释放磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/share/swift || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          sudo swapoff -a || true
+          sudo rm -f /swapfile || true
+          df -hT /
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -y install \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev libelf-dev python3-setuptools \
+            rsync swig unzip zlib1g-dev file wget cmake time ccache llvm \
+            dwarves python3-pyelfutils
+          sudo apt-get -qq autoremove --purge || true
+
+      - name: 更新并安装 feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 生成 .config（360T7 + AdGuard Home + EQoS）
+        run: |
+          set -e
+          rm -f .config
+          cp -f "$REPO_BASE_CONFIG" .config
+
+          # 机型是否存在，不存在就列出可选机型后报错退出
+          if ! grep -rqs "^define Device/${DEVICE}\$" target/linux/mediatek/image/; then
+            echo "::error::源码中找不到机型 ${DEVICE}，该仓库可选 360T7 机型："
+            grep -rhoE "qihoo_360t7[a-zA-Z0-9_.-]*" target/linux/mediatek/image/ | sort -u
+            exit 1
+          fi
+
+          # 清掉基础配置里的其它机型，只编 360T7（省时间，也避免镜像串味）
+          sed -ri '/^CONFIG_TARGET_DEVICE(_PACKAGES)?_mediatek_filogic_DEVICE_/d' .config
+
+          {
+            echo "CONFIG_TARGET_MULTI_PROFILE=y"
+            echo "CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_${DEVICE}=y"
+          } >> .config
+
+          # ---- AdGuard Home ----
+          if [ "$WITH_AGH" = "true" ]; then
+            cat >> .config <<'EOF'
+          CONFIG_PACKAGE_adguardhome=y
+          CONFIG_PACKAGE_luci-app-adguardhome=y
+          CONFIG_PACKAGE_luci-i18n-adguardhome-zh-cn=y
+          EOF
+          fi
+
+          # ---- EQoS ----
+          # 社区通用版请改成：
+          #   CONFIG_PACKAGE_luci-app-eqos=y
+          #   CONFIG_PACKAGE_luci-i18n-eqos-zh-cn=y
+          if [ "$WITH_EQOS" = "true" ]; then
+            cat >> .config <<'EOF'
+          CONFIG_PACKAGE_luci-app-eqos-mtk=y
+          CONFIG_PACKAGE_luci-i18n-eqos-mtk-zh-cn=y
+          EOF
+          fi
+
+          # ---- 额外插件 ----
+          for pkg in $EXTRA_PKGS; do
+            echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+          done
+
+          make defconfig
+
+          # 反查确认插件真的被选上（依赖不满足时 defconfig 会静默丢掉）
+          echo "==== 最终机型与插件 ===="
+          grep -E "^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_" .config || true
+          for p in adguardhome luci-app-adguardhome luci-app-eqos-mtk; do
+            if ! grep -qs "^CONFIG_PACKAGE_${p}=y$" .config; then
+              echo "::error::插件 ${p} 未能选中（依赖缺失或未收录），请检查上方 feeds 输出"
+              exit 1
+            fi
+          done
+          echo "OK：机型与插件检查通过"
+
+      - name: 预下载源码包
+        run: make -j$(nproc) defconfig download clean WERROR=0 || true
+
+      - name: 编译固件
+        run: |
+          make -j$(nproc) || make -j1 V=s
+
+      - name: 整理固件文件
+        run: |
+          set -e
+          mkdir -p out
+          find bin/targets -maxdepth 3 -type f \( -name "*.itb" -o -name "*.bin" -o -name "*.manifest" \
+            -o -name "*.buildinfo" -o -name "sha256sums" \) -exec cp -f {} out/ \;
+          cp -f .config out/config-360t7-$(date +%Y%m%d)
+          ( cd out && sha256sum * > SHA256SUMS.txt )
+          echo "==== 产物 ===="
+          ls -lh out
+          echo "FIRMWARE_DIR=$(pwd)/out" >> "$GITHUB_ENV"
+
+      - name: 上传 Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-360t7-${{ env.DEVICE }}-${{ github.run_number }}
+          path: out/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: 发布 GitHub Release
+        if: ${{ github.event.inputs.upload_release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: 360t7-r${{ github.run_number }}
+          name: ImmortalWrt 360T7 (AGH + EQoS) r${{ github.run_number }}
+          body: |
+            机型：${{ env.DEVICE }}
+            插件：AdGuard Home、EQoS（luci-app-eqos-mtk）
+            源码：chasey-dev/immortalwrt-mt798x-rebase @ 25.12
+            刷机：U-Boot 恢复页或 LuCI 系统升级，选 *-squashfs-sysupgrade.itb
+          files: out/*
+          prerelease: true

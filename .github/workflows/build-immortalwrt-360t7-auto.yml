@@ -1,0 +1,272 @@
+name: Build ImmortalWrt mt798x - 360T7 (auto track upstream)
+
+# 用途：
+#   每天定时检查上游 chasey-dev/immortalwrt-mt798x-rebase 是否有新提交，
+#   有更新才编译 360T7 固件（内置 AdGuard Home + EQoS），没更新就直接跳过、不占 runner 时间。
+#   编译的是上游最新源码，不需要你手动 Sync fork。
+#
+# 用法：
+#   1. Fork chasey-dev/immortalwrt-mt798x-rebase（默认分支 25.12）
+#   2. 本文件放到你 fork 的 .github/workflows/ 下，提交进默认分支
+#   3. Actions 页面确认 "Workflows are inactive" 之类提示已解除（新 fork 需手动一次 Enable workflows）
+#   4. 之后每天自动跑；也可以随时 Run workflow 手动触发（勾选 Force build 可无视上游更新强行编）
+#
+# 注意：
+#   - cron 用 UTC：下面 '0 1 * * *' = 北京时间 09:00；改成 '0 1,9 * * *' 就是每天两次
+#   - GitHub 对 fork 仓库的 schedule 有 60 天不活跃自动停用机制：偶尔手动跑一次或 push 一下即可
+#   - 只在编译成功后才记录"已编译到的上游 commit"，失败的话下一次仍会自动重试
+#   - 上游机型来自 target/linux/mediatek/image/filogic.mk：qihoo_360t7 / qihoo_360t7-ubi
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "360T7 分区方案（不清楚就选 qihoo_360t7）"
+        type: choice
+        default: qihoo_360t7
+        options:
+          - qihoo_360t7
+          - qihoo_360t7-ubi
+      force_build:
+        description: "Force build - 上游无更新也强制编译"
+        type: boolean
+        default: false
+      enable_adguardhome:
+        description: "内置 AdGuard Home（含 LuCI + 中文包）"
+        type: boolean
+        default: true
+      enable_eqos:
+        description: "内置 EQoS 流量限速（luci-app-eqos-mtk）"
+        type: boolean
+        default: true
+      extra_packages:
+        description: "额外插件，空格分隔（例：luci-app-ddns luci-app-ttyd）"
+        required: false
+        type: string
+        default: ""
+      upload_release:
+        description: "同时发布 GitHub Release"
+        type: boolean
+        default: false
+  schedule:
+    # UTC 01:00 = 北京时间 09:00
+    - cron: "0 1 * * *"
+
+env:
+  UPSTREAM: chasey-dev/immortalwrt-mt798x-rebase
+  UPSTREAM_BRANCH: 25.12
+  REPO_BASE_CONFIG: defconfig/mt7981-ax3000.config
+
+concurrency:
+  group: build-immortalwrt-360t7
+  cancel-in-progress: false
+
+jobs:
+  # 轻量探测：只看上游有没有新 commit，没有就把整个 build 任务跳过
+  detect-update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      changed: ${{ steps.cmp.outputs.changed }}
+      sha: ${{ steps.latest.outputs.sha }}
+      sha8: ${{ steps.latest.outputs.sha8 }}
+    steps:
+      - name: 读取上游最新 commit
+        id: latest
+        run: |
+          set -e
+          SHA=$(curl -sS --retry 3 --max-time 60 \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$UPSTREAM/commits?sha=$UPSTREAM_BRANCH&per_page=1" \
+            | jq -r '.[0].sha')
+          if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
+            echo "::error::取不到上游 $UPSTREAM/$UPSTREAM_BRANCH 的最新 commit"
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "sha8=${SHA:0:8}" >> "$GITHUB_OUTPUT"
+          echo "上游最新：$UPSTREAM @ ${SHA:0:8} ($UPSTREAM_BRANCH)"
+
+      - name: 恢复上次已编译 commit 记录
+        uses: actions/cache@v4
+        with:
+          path: ci-state/
+          key: ci-360t7-state-${{ github.run_id }}
+          restore-keys: |
+            ci-360t7-state-
+
+      - name: 与上次编译结果比对
+        id: cmp
+        run: |
+          PREV=""
+          if [ -f ci-state/last_built_sha ]; then
+            PREV=$(cat ci-state/last_built_sha)
+          fi
+          FORCE="${{ github.event.inputs.force_build }}"
+          if [ "$PREV" = "${{ steps.latest.outputs.sha }}" ] && [ "$FORCE" != "true" ]; then
+            echo "上游无新提交（上次已编译 ${PREV:0:8}），本次跳过"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            [ -n "$PREV" ] && echo "检测到更新：${PREV:0:8} -> ${{ steps.latest.outputs.sha8 }}" || echo "首次运行，全量编译"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: detect-update
+    if: needs.detect-update.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      contents: write
+    env:
+      DEVICE: ${{ github.event.inputs.device || 'qihoo_360t7' }}
+      WITH_AGH: ${{ github.event.inputs.enable_adguardhome != 'false' }}
+      WITH_EQOS: ${{ github.event.inputs.enable_eqos != 'false' }}
+      EXTRA_PKGS: ${{ github.event.inputs.extra_packages }}
+      UPSTREAM_SHA: ${{ needs.detect-update.outputs.sha }}
+    steps:
+      - name: 检出本仓库（取 workflow 文件与状态缓存）
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 1
+
+      - name: 备份 workflows 目录（切到上游 commit 后会被移除）
+        run: cp -a .github /tmp/workflows-backup 2>/dev/null || true
+
+      - name: 切到上游最新源码
+        run: |
+          set -e
+          git fetch --depth 1 "https://github.com/$UPSTREAM.git" "$UPSTREAM_SHA"
+          git checkout -f FETCH_HEAD
+          git log -1 --oneline
+          test -f "$REPO_BASE_CONFIG" || { echo "::error::源码异常，缺少 $REPO_BASE_CONFIG"; exit 1; }
+
+      - name: 释放磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/share/swift || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          sudo swapoff -a || true
+          sudo rm -f /swapfile || true
+          df -hT /
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -y install \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev libelf-dev python3-setuptools \
+            rsync swig unzip zlib1g-dev file wget cmake time ccache llvm \
+            dwarves python3-pyelfutils
+          sudo apt-get -qq autoremove --purge || true
+
+      - name: 更新并安装 feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 生成 .config（360T7 + AdGuard Home + EQoS）
+        run: |
+          set -e
+          rm -f .config
+          cp -f "$REPO_BASE_CONFIG" .config
+
+          # 上游若改名/删机型，直接报错并列出可用机型，不产出空固件
+          if ! grep -rqs "^define Device/${DEVICE}\$" target/linux/mediatek/image/; then
+            echo "::error::上游源码中找不到机型 ${DEVICE}，当前可选 360T7 机型："
+            grep -rhoE "qihoo_360t7[a-zA-Z0-9_.-]*" target/linux/mediatek/image/ | sort -u
+            exit 1
+          fi
+
+          # 基础配置里带了整机 mediatek 机型，清掉只留 360T7，省一大半编译时间
+          sed -ri '/^CONFIG_TARGET_DEVICE(_PACKAGES)?_mediatek_filogic_DEVICE_/d' .config
+          {
+            echo "CONFIG_TARGET_MULTI_PROFILE=y"
+            echo "CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_${DEVICE}=y"
+          } >> .config
+
+          if [ "$WITH_AGH" = "true" ]; then
+            cat >> .config <<'EOF'
+          CONFIG_PACKAGE_adguardhome=y
+          CONFIG_PACKAGE_luci-app-adguardhome=y
+          CONFIG_PACKAGE_luci-i18n-adguardhome-zh-cn=y
+          EOF
+          fi
+
+          # EQoS 用本仓库 MTK 方案自带的 eqos-mtk；
+          # 想要社区通用版改成：CONFIG_PACKAGE_luci-app-eqos=y / luci-i18n-eqos-zh-cn=y
+          if [ "$WITH_EQOS" = "true" ]; then
+            cat >> .config <<'EOF'
+          CONFIG_PACKAGE_luci-app-eqos-mtk=y
+          CONFIG_PACKAGE_luci-i18n-eqos-mtk-zh-cn=y
+          EOF
+          fi
+
+          for pkg in $EXTRA_PKGS; do
+            echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+          done
+
+          make defconfig
+
+          echo "==== 机型与插件确认 ===="
+          grep -E "^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_" .config || true
+          for p in adguardhome luci-app-adguardhome luci-app-eqos-mtk; do
+            if ! grep -qs "^CONFIG_PACKAGE_${p}=y$" .config; then
+              echo "::error::插件 ${p} 未能选中（上游 feeds 依赖变动或收录变化），本次编译中止"
+              exit 1
+            fi
+          done
+          echo "OK：机型与插件检查通过"
+
+      - name: 预下载源码包
+        run: make -j$(nproc) defconfig download clean WERROR=0 || true
+
+      - name: 编译固件
+        run: make -j$(nproc) || make -j1 V=s
+
+      - name: 整理固件文件
+        run: |
+          set -e
+          mkdir -p out
+          find bin/targets -maxdepth 3 -type f \( -name "*.itb" -o -name "*.bin" \
+            -o -name "*.manifest" -o -name "*.buildinfo" -o -name "sha256sums" \) -exec cp -f {} out/ \;
+          cp -f .config "out/config-360t7-$(date +%Y%m%d)"
+          ( cd out && sha256sum * > SHA256SUMS.txt )
+          ls -lh out
+
+      - name: 上传 Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-360t7-${{ env.DEVICE }}-${{ needs.detect-update.outputs.sha8 }}
+          path: out/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: 发布 GitHub Release
+        if: ${{ github.event.inputs.upload_release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: 360t7-auto-${{ needs.detect-update.outputs.sha8 }}
+          name: ImmortalWrt 360T7 auto r${{ github.run_number }}
+          body: |
+            上游 commit：${{ env.UPSTREAM_SHA }}
+            机型：${{ env.DEVICE }} ｜ 插件：AdGuard Home + EQoS
+          files: out/*
+          prerelease: true
+
+      # 只有走到这一步（编译成功）才记录"已编到哪个上游 commit"
+      - name: 记录已编译的上游 commit
+        uses: actions/cache@v4
+        with:
+          path: ci-state/
+          key: ci-360t7-state-${{ github.run_id }}
+          restore-keys: |
+            ci-360t7-state-
+
+      - name: 写入状态文件
+        run: |
+          mkdir -p ci-state
+          echo "$UPSTREAM_SHA" > ci-state/last_built_sha
+          cat ci-state/last_built_sha
