@@ -1,0 +1,476 @@
+name: Build ImmortalWrt mt798x - 360T7 slim (EQoS + AppFilter/OAF)
+
+# 精简版：去掉 AdGuard Home，改用 AppFilter(OpenAppFilter)，并把 kmod-oaf 直接编进固件
+#
+# 用法：
+#   1. 任意一个你自己的仓库（不需要 fork，空仓库只放这个文件也能跑）
+#   2. 本文件放到 .github/workflows/ 下，提交到默认分支
+#   3. Actions -> Run workflow（或等每天定时自动跑）
+#
+# 关键点：
+#   - kmod-oaf 是内核模块，必须与固件内核完全匹配，所以这里在编译阶段就编进镜像，
+#     不靠后期 opkg 安装；编译后还会校验 manifest 里确实有 kmod-oaf，没有就报错。
+#   - AppFilter 三个源码包（oaf=kmod、open-app-filter=appfilter 服务、luci-app-oaf=界面）
+#     从 https://github.com/destan19/OpenAppFilter 拉取后直接放进 package/ 参与构建，
+#     不走 feeds install（内核模块走 feeds 索引容易漏）。
+#   - 精简项：adguardhome、passwall/ssr-plus/vssr/openclash、upnp、tcpdump、htop、nano、
+#     sftp-server、argon 主题全部关掉；zram-swap 保留（256M 内存明显减少 OOM）。
+#   - 若 kmod-oaf 在 25.12（内核 6.12）下编不过，把 upstream_branch 改成 rework-24.10 重跑。
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "360T7 分区方案（不清楚就选 qihoo_360t7）"
+        type: choice
+        default: qihoo_360t7
+        options:
+          - qihoo_360t7
+          - qihoo_360t7-ubi
+      upstream_branch:
+        description: "上游分支（kmod-oaf 编不过时可换 rework-24.10）"
+        type: string
+        default: "25.12"
+      force_build:
+        description: "Force build - 上游无更新也强制编译"
+        type: boolean
+        default: false
+      enable_eqos:
+        description: "内置 EQoS 流量限速（luci-app-eqos-mtk）"
+        type: boolean
+        default: true
+      extra_packages:
+        description: "额外插件，空格分隔（例：luci-app-wol）"
+        required: false
+        type: string
+        default: ""
+      upload_release:
+        description: "同时发布 GitHub Release"
+        type: boolean
+        default: false
+  schedule:
+    # UTC 01:00 = 北京时间 09:00
+    - cron: "0 1 * * *"
+
+env:
+  UPSTREAM: chasey-dev/immortalwrt-mt798x-rebase
+  UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch || '25.12' }}
+  OAF_REPO: destan19/OpenAppFilter
+  SRC_DIR: openwrt
+  REPO_BASE_CONFIG: defconfig/mt7981-ax3000.config
+
+concurrency:
+  group: build-360t7-slim-oaf
+  cancel-in-progress: false
+
+jobs:
+  detect-update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      changed: ${{ steps.cmp.outputs.changed }}
+      sha: ${{ steps.latest.outputs.sha }}
+      sha8: ${{ steps.latest.outputs.sha8 }}
+    steps:
+      - name: 读取上游最新 commit
+        id: latest
+        run: |
+          set -e
+          SHA=$(curl -sS --retry 3 --max-time 60 \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$UPSTREAM/commits?sha=$UPSTREAM_BRANCH&per_page=1" \
+            | jq -r '.[0].sha')
+          if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
+            echo "::error::取不到上游 $UPSTREAM/$UPSTREAM_BRANCH 的最新 commit"
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "sha8=${SHA:0:8}" >> "$GITHUB_OUTPUT"
+          echo "上游最新：$UPSTREAM @ ${SHA:0:8} ($UPSTREAM_BRANCH)"
+
+      - name: 恢复上次已编译 commit 记录
+        uses: actions/cache@v4
+        with:
+          path: ci-state/
+          key: ci-360t7-slim-state-${{ github.run_id }}
+          restore-keys: |
+            ci-360t7-slim-state-
+
+      - name: 与上次编译结果比对
+        id: cmp
+        run: |
+          PREV=""
+          [ -f ci-state/last_built_sha ] && PREV=$(cat ci-state/last_built_sha)
+          if [ "$PREV" = "$SHA" ] && [ "${{ github.event.inputs.force_build }}" != "true" ]; then
+            echo "上游无新提交（上次已编 ${PREV:0:8}），本次跳过编译"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            if [ -n "$PREV" ]; then
+              echo "检测到更新：${PREV:0:8} -> ${SHA:0:8}"
+            else
+              echo "首次运行，全量编译"
+            fi
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          SHA: ${{ steps.latest.outputs.sha }}
+
+  build:
+    needs: detect-update
+    if: needs.detect-update.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      contents: write
+    env:
+      DEVICE: ${{ github.event.inputs.device || 'qihoo_360t7' }}
+      WITH_EQOS: ${{ github.event.inputs.enable_eqos != 'false' }}
+      EXTRA_PKGS: ${{ github.event.inputs.extra_packages }}
+      UPSTREAM_SHA: ${{ needs.detect-update.outputs.sha }}
+    defaults:
+      run:
+        working-directory: openwrt
+    steps:
+      - name: 释放磁盘空间
+        working-directory: .
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/share/swift || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          sudo swapoff -a || true
+          sudo rm -f /swapfile || true
+          df -hT /
+
+      - name: 安装编译依赖
+        working-directory: .
+        run: |
+          sudo -E apt-get -o Acquire::Retries=3 update
+          PKGS="build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+          gettext git libncurses-dev libssl-dev libelf-dev python3-setuptools \
+          python3-pyelftools rsync swig unzip zlib1g-dev file wget cmake time \
+          ccache llvm dwarves device-tree-compiler"
+          AVAIL=""
+          for p in $PKGS; do
+            if apt-cache show "$p" >/dev/null 2>&1; then
+              AVAIL="$AVAIL $p"
+            else
+              echo "::notice::跳过不存在的包：$p"
+            fi
+          done
+          sudo -E DEBIAN_FRONTEND=noninteractive apt-get -y install $AVAIL
+          sudo apt-get -qq autoremove --purge || true
+
+      - name: 拉取上游源码
+        working-directory: .
+        run: |
+          set -e
+          git config --global --add safe.directory '*'
+          git init -q "$SRC_DIR"
+          git -C "$SRC_DIR" remote add origin "https://github.com/$UPSTREAM"
+          git -C "$SRC_DIR" fetch --depth 1 origin "$UPSTREAM_SHA"
+          git -C "$SRC_DIR" checkout -q -f FETCH_HEAD
+          git -C "$SRC_DIR" log -1 --format='源码 commit：%h %ci %s'
+          for f in scripts/feeds "$REPO_BASE_CONFIG" target/linux/mediatek/image/filogic.mk; do
+            test -e "$SRC_DIR/$f" || { echo "::error::源码异常，缺少 $f"; exit 1; }
+          done
+          grep -rqs "^define Device/${DEVICE}\$" "$SRC_DIR/target/linux/mediatek/image/" \
+            || { echo "::error::分支 $UPSTREAM_BRANCH 没有机型 ${DEVICE}，可选："; \
+                 grep -rhoE "qihoo_360t7[a-zA-Z0-9_.-]*" "$SRC_DIR/target/linux/mediatek/image/" | sort -u; exit 1; }
+
+      - name: 更新 feeds 并引入 AppFilter 源码
+        run: |
+          set -e
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          # AppFilter：直接放进 package/ 参与构建，kmod-oaf 才能被选中
+          rm -rf /tmp/oaf-src
+          git clone --depth 1 "https://github.com/$OAF_REPO.git" /tmp/oaf-src
+          git -C /tmp/oaf-src log -1 --format='AppFilter commit：%h %ci'
+          for d in oaf open-app-filter luci-app-oaf; do
+            test -d "/tmp/oaf-src/$d" || { echo "::error::OAF 仓库结构变动，缺少 $d"; exit 1; }
+            rm -rf "package/$d"
+            cp -a "/tmp/oaf-src/$d" "package/$d"
+          done
+          # 自检：确认 kmod 定义与服务包名符合预期
+          grep -qs "^define KernelPackage/oaf" package/oaf/Makefile \
+            || { echo "::error::package/oaf 里没有 KernelPackage/oaf，kmod-oaf 无法编出"; exit 1; }
+          grep -qs "^PKG_NAME:=appfilter" package/open-app-filter/Makefile \
+            || { echo "::error::appfilter 包名异常"; exit 1; }
+          echo "AppFilter 源码就位：kmod-oaf / appfilter / luci-app-oaf"
+
+      - name: 生成精简 .config（360T7 + EQoS + AppFilter）
+        run: |
+          set -e
+          rm -f .config
+          cp -f "$REPO_BASE_CONFIG" .config
+
+          # 只保留 360T7，清掉基础配置里其它 mediatek 机型
+          sed -ri '/^CONFIG_TARGET_DEVICE(_PACKAGES)?_mediatek_filogic_DEVICE_/d' .config
+          {
+            echo "CONFIG_TARGET_MULTI_PROFILE=y"
+            echo "CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_${DEVICE}=y"
+          } >> .config
+
+          # ---- 精简：关掉占内存/占闪存又用不上的东西 ----
+          for p in adguardhome luci-app-adguardhome luci-i18n-adguardhome-zh-cn \
+                   luci-app-passwall luci-app-ssr-plus luci-app-vssr luci-app-openclash \
+                   luci-app-upnp miniupnpd tcpdump htop nano openssh-sftp-server \
+                   luci-theme-argon; do
+            echo "# CONFIG_PACKAGE_${p} is not set" >> .config
+          done
+          # 256M 内存设备上 zram 换页，明显减少 OOM
+          echo "CONFIG_PACKAGE_zram-swap=y" >> .config
+
+          # ---- AppFilter（含内核模块，必须内置）----
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_kmod-oaf=y
+          CONFIG_PACKAGE_appfilter=y
+          CONFIG_PACKAGE_luci-app-oaf=y
+          CONFIG_PACKAGE_luci-compat=y
+          CONFIG_PACKAGE_luci-lib-jsonc=y
+          EOF
+
+          if [ "$WITH_EQOS" = "true" ]; then
+            cat >> .config <<'EOF'
+          CONFIG_PACKAGE_luci-app-eqos-mtk=y
+          CONFIG_PACKAGE_luci-i18n-eqos-mtk-zh-cn=y
+          EOF
+          fi
+
+          for pkg in $EXTRA_PKGS; do
+            echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+          done
+
+          make defconfig
+
+          echo "==== 机型确认 ===="
+          grep -E "^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_" .config || true
+          echo "==== 必选项确认 ===="
+          MISSING=""
+          for p in kmod-oaf appfilter luci-app-oaf luci-app-eqos-mtk; do
+            if grep -qs "^CONFIG_PACKAGE_${p}=y$" .config; then
+              echo "OK  ${p}"
+            else
+              echo "MISS ${p}"
+              MISSING="$MISSING $p"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::以下包未能选中：$MISSING（kmod-oaf 缺失通常是内核版本不兼容，可把 upstream_branch 换成 rework-24.10）"
+            exit 1
+          fi
+          echo "==== 确认已关闭 AdGuard Home ===="
+          if grep -qs "^CONFIG_PACKAGE_adguardhome=y$" .config; then
+            echo "::error::AdGuard Home 仍然被选中，请检查依赖"
+            exit 1
+          fi
+          echo "OK：精简 + AppFilter 配置检查通过"
+
+      - name: 写入首次开机初始化（LAN 7.7.7.7 / 无线 666、666-5G）
+        run: |
+          set -e
+          mkdir -p files/etc/uci-defaults
+          cat > files/etc/uci-defaults/99-360t7-init <<'EOS'
+          #!/bin/sh
+          # 360T7 首次开机初始化（编译时打包，只跑一次）
+          # LAN 7.7.7.7/24 ；2.4G SSID 666 ；5G SSID 666-5G ；密码 m66666666
+          LAN_IP='7.7.7.7'
+          LAN_MASK='255.255.255.0'
+          SSID_2G='666'
+          SSID_5G='666-5G'
+          WIFI_KEY='m66666666'
+          WIFI_ENC='psk2+ccmp'
+
+          # ---------- LAN ----------
+          uci -q get network.lan >/dev/null || uci set network.lan=interface
+          uci set network.lan.proto='static'
+          uci set network.lan.ipaddr="$LAN_IP"
+          uci set network.lan.netmask="$LAN_MASK"
+          uci commit network
+          if uci -q get dhcp.lan >/dev/null; then
+            uci set dhcp.lan.start='100'
+            uci set dhcp.lan.limit='150'
+            uci commit dhcp
+          fi
+
+          # ---------- 时区 / 主机名 / 语言 ----------
+          if uci -q get system.@system[0] >/dev/null; then
+            uci set system.@system[0].timezone='CST-8'
+            uci set system.@system[0].zonename='Asia/Shanghai'
+            uci set system.@system[0].hostname='ImmortalWrt-360T7'
+            uci commit system
+          fi
+          if uci -q get luci.main >/dev/null; then
+            uci set luci.main.lang='zh-cn'
+            uci commit luci
+          fi
+
+          # ---------- 无线 ----------
+          # 按 band 匹配，兼容 mac80211(band=2g/5g) 与 MTK 驱动(ra0/rax0) 两种写法
+          set_band() {
+            band="$1"; ssid="$2"; i=0; hit=0
+            while uci -q get "wireless.@wifi-iface[$i]" >/dev/null 2>&1; do
+              dev="$(uci -q get "wireless.@wifi-iface[$i].device")"
+              b="$(uci -q get "wireless.@wifi-iface[$i].band")"
+              if [ -z "$b" ] && [ -n "$dev" ]; then
+                b="$(uci -q get "wireless.$dev.band")"
+              fi
+              if [ -z "$b" ] && [ -n "$dev" ]; then
+                case "$dev" in
+                  *rax*|*rai*|*5g*) b='5g' ;;
+                  *ra*) b='2g' ;;
+                esac
+              fi
+              if [ -z "$b" ] && [ -n "$dev" ]; then
+                case "$(uci -q get "wireless.$dev.hwmode")" in
+                  11a|a) b='5g' ;;
+                  11g|11b|11bg|g|b|bg) b='2g' ;;
+                esac
+              fi
+              case "$b" in
+                5g|5G|11a) b='5g' ;;
+                2g|2G|11g|11b|11bg) b='2g' ;;
+              esac
+              if [ "$b" = "$band" ]; then
+                uci set "wireless.@wifi-iface[$i].ssid=$ssid"
+                uci set "wireless.@wifi-iface[$i].key=$WIFI_KEY"
+                uci set "wireless.@wifi-iface[$i].encryption=$WIFI_ENC"
+                uci set "wireless.@wifi-iface[$i].disabled=0"
+                hit=1
+              fi
+              i=$((i + 1))
+            done
+            echo "$hit"
+          }
+
+          # 统计已有的无线接口数量，供兜底使用
+          cnt=0
+          while uci -q get "wireless.@wifi-iface[$cnt]" >/dev/null 2>&1; do
+            cnt=$((cnt + 1))
+          done
+
+          hit2g=0
+          hit5g=0
+          if [ "$cnt" -gt 0 ]; then
+            hit2g="$(set_band 2g "$SSID_2G")"
+            hit5g="$(set_band 5g "$SSID_5G")"
+            # 完全没有 band 线索时兜底：第一个口 2.4G，第二个口 5G
+            if [ "$hit2g" = "0" ] && [ "$hit5g" = "0" ]; then
+              uci set "wireless.@wifi-iface[0].ssid=$SSID_2G"
+              uci set "wireless.@wifi-iface[0].key=$WIFI_KEY"
+              uci set "wireless.@wifi-iface[0].encryption=$WIFI_ENC"
+              uci set "wireless.@wifi-iface[0].disabled=0"
+              hit2g=1
+              if [ "$cnt" -gt 1 ]; then
+                uci set "wireless.@wifi-iface[1].ssid=$SSID_5G"
+                uci set "wireless.@wifi-iface[1].key=$WIFI_KEY"
+                uci set "wireless.@wifi-iface[1].encryption=$WIFI_ENC"
+                uci set "wireless.@wifi-iface[1].disabled=0"
+                hit5g=1
+              fi
+            fi
+            i=0
+            while uci -q get "wireless.@wifi-device[$i]" >/dev/null 2>&1; do
+              uci set "wireless.@wifi-device[$i].disabled=0"
+              i=$((i + 1))
+            done
+            uci commit wireless
+          fi
+
+          # 若 wireless 配置是驱动开机时才生成的，本次改不到：
+          # 换一个文件名再排一次，下次开机重试（成功后框架会自动删除）
+          if [ "$hit2g" = "0" ] || [ "$hit5g" = "0" ]; then
+            if [ "$(basename "$0")" = "99-360t7-init" ]; then
+              cp -f "$0" /etc/uci-defaults/97-360t7-wifi-retry 2>/dev/null || true
+            else
+              cp -f "$0" /etc/uci-defaults/99-360t7-init 2>/dev/null || true
+            fi
+          fi
+
+          exit 0
+          EOS
+          chmod +x files/etc/uci-defaults/99-360t7-init
+          echo "已写入 files/etc/uci-defaults/99-360t7-init"
+          grep -nE "LAN_IP=|SSID_2G=|SSID_5G=|WIFI_KEY=" files/etc/uci-defaults/99-360t7-init
+
+      - name: 预下载源码包
+        run: make -j$(nproc) defconfig download clean WERROR=0 || true
+
+      - name: 编译固件
+        run: make -j$(nproc) || make -j1 V=s
+
+      - name: 校验 kmod-oaf 已编入固件
+        run: |
+          set -e
+          MANIFEST=$(ls bin/targets/mediatek/filogic/*.manifest 2>/dev/null | head -1)
+          [ -n "$MANIFEST" ] || { echo "::error::找不到 manifest，编译可能没产出镜像"; exit 1; }
+          echo "manifest：$MANIFEST"
+          grep -E "^(kmod-oaf|appfilter|luci-app-oaf) " "$MANIFEST" || true
+          for p in kmod-oaf appfilter luci-app-oaf; do
+            grep -qs "^${p} " "$MANIFEST" \
+              || { echo "::error::镜像里没有 ${p}，装到机器上会缺功能/装不上"; exit 1; }
+          done
+          ls bin/targets/mediatek/filogic/kmod-oaf*.ipk >/dev/null 2>&1 \
+            && echo "kmod-oaf ipk 已生成（与固件内核版本一致，可留作同版本重装）" || true
+
+      - name: 校验首次开机脚本已进镜像
+        run: |
+          set -e
+          D=$(ls -d build_dir/target-*/root-* 2>/dev/null | head -1)
+          [ -n "$D" ] || { echo "::error::找不到 rootfs 暂存目录，编译可能没到打包阶段"; exit 1; }
+          S="$D/etc/uci-defaults/99-360t7-init"
+          [ -f "$S" ] || { echo "::error::镜像里没有 $S（files/ 目录未被打包）"; exit 1; }
+          echo "OK  $S 已打包"
+          grep -q "LAN_IP='7.7.7.7'" "$S" || { echo "::error::脚本内容异常：LAN 地址不是 7.7.7.7"; exit 1; }
+          grep -q "SSID_5G='666-5G'" "$S" || { echo "::error::脚本内容异常：5G SSID 不对"; exit 1; }
+          echo "OK  预置参数：LAN 7.7.7.7 / 666 / 666-5G"
+
+      - name: 整理固件文件
+        run: |
+          set -e
+          mkdir -p out
+          find bin/targets -maxdepth 3 -type f \( -name "*.itb" -o -name "*.bin" \
+            -o -name "*.manifest" -o -name "*.buildinfo" -o -name "sha256sums" \
+            -o -name "kmod-oaf*.ipk" \) -exec cp -f {} out/ \;
+          cp -f .config "out/config-360t7-slim-$(date +%Y%m%d)"
+          ( cd out && sha256sum * > SHA256SUMS.txt )
+          ls -lh out
+
+      - name: 上传 Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-360t7-slim-${{ env.DEVICE }}-${{ needs.detect-update.outputs.sha8 }}
+          path: openwrt/out/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: 发布 GitHub Release
+        if: ${{ github.event.inputs.upload_release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: 360t7-slim-${{ needs.detect-update.outputs.sha8 }}
+          name: ImmortalWrt 360T7 slim (EQoS + AppFilter) ${{ needs.detect-update.outputs.sha8 }}
+          body: |
+            机型：${{ env.DEVICE }} ｜ 分支：${{ env.UPSTREAM_BRANCH }}
+            插件：EQoS(luci-app-eqos-mtk) + AppFilter(kmod-oaf/appfilter/luci-app-oaf)
+            已移除：AdGuard Home、passwall/ssr-plus/openclash、upnp、tcpdump 等
+          files: openwrt/out/*
+          prerelease: true
+
+      - name: 记录已编译的上游 commit
+        working-directory: .
+        run: |
+          mkdir -p ci-state
+          echo "$UPSTREAM_SHA" > ci-state/last_built_sha
+          cat ci-state/last_built_sha
+
+      - name: 保存状态缓存
+        working-directory: .
+        uses: actions/cache@v4
+        with:
+          path: ci-state/
+          key: ci-360t7-slim-state-${{ github.run_id }}
+          restore-keys: |
+            ci-360t7-slim-state-
