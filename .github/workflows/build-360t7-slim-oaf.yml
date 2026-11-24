@@ -467,7 +467,6 @@ jobs:
           cat ci-state/last_built_sha
 
       - name: 保存状态缓存
-        working-directory: .
         uses: actions/cache@v4
         with:
           path: ci-state/
